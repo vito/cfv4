@@ -1,0 +1,311 @@
+---
+resources:
+- name: buildpack
+  type: git
+  source:
+    uri: https://github.com/cloudfoundry/ruby-buildpack
+    branch: master
+
+- name: app-source
+  type: git
+  source:
+    uri: https://github.com/vito/dora
+    branch: master
+
+- name: droplet
+  type: s3
+  source:
+    bucket: {{droplet-bucket-name}}
+    access_key_id: {{droplet-bucket-access-key-id}}
+    secret_access_key: {{droplet-bucket-secret-access-key}}
+    versioned_file: droplet.tgz
+
+- name: hm9001
+  type: time
+  source:
+    # not actually this frequent since the Concourse polling
+    # interval defaults to 1 minute
+    interval: 10s
+
+- name: instances
+  type: pool
+  source:
+    uri: {{instances-pool-uri}}
+    branch: master
+    private_key: {{instances-pool-private-key}}
+    pool: instances
+
+- name: all-instances
+  type: git
+  source:
+    uri: {{instances-pool-uri}}
+    branch: master
+    private_key: {{instances-pool-private-key}}
+    branch: master
+
+jobs:
+- name: stage
+  plan:
+  - aggregate:
+    - get: app-source
+      trigger: true
+    - get: buildpack
+  - task: stage
+    config:
+      platform: linux
+      # stage using standard stack image
+      image: docker:///cloudfoundry/cflinuxfs2
+      inputs:
+      - name: app-source
+      - name: buildpack
+      params:
+        # bypass stack check performed by cf buildpacks
+        # (not needed for heroku buildpacks)
+        CF_STACK: cflinuxfs2
+      run:
+        # some buildpacks (e.g. ruby) depend on working directory :(
+        # otherwise this could just run buildpack/bin/compile
+        path: sh
+        args: [-c, 'cd app-source && ../buildpack/bin/compile . /tmp/cache']
+  - task: build-droplet
+    config:
+      platform: linux
+      image: docker:///cloudfoundry/cflinuxfs2
+      inputs:
+      - name: stage
+      - name: buildpack
+      run:
+        path: bash
+        args:
+          - -c
+          - |
+            set -e -x
+
+            root=$PWD
+
+            cd stage/app-source
+
+            # determine start command via bin/release
+            start_command=$($root/buildpack/bin/release . | grep 'web:' | sed -e 's/^ *web: //')
+
+            # save start command for future droplet execution
+            cat > start.sh <<EOF
+            #!/bin/sh
+            $start_command
+            EOF
+
+            chmod +x start.sh
+
+            # create droplet
+            tar czf $root/droplet.tgz .
+  - put: droplet
+    params: {from: build-droplet/droplet.tgz}
+
+- name: run
+  # scale up/down to set expected app instances
+  max_in_flight: 2
+  plan:
+  - get: droplet
+    passed: [stage]
+    trigger: true
+  - get: hm9001
+    trigger: true
+  - task: create-instance
+    config:
+      platform: linux
+      image: docker:///busybox
+      run:
+        path: sh
+        args:
+        - -c
+        - |
+          set -e -x
+          # generate random instance hostname
+          echo $(od -vAn -N4 -tx4 < /dev/urandom) > name
+          echo > metadata
+  - put: instances
+    params: {add: create-instance}
+  - put: instances
+    params: {acquire: true}
+  - task: run
+    config:
+      platform: linux
+      image: docker:///cfv4/cfv4-app-stack
+      inputs:
+      - name: droplet
+      - name: instances
+      params:
+        PORT: 8080
+        NGROK_TOKEN: {{ngrok-token}}
+      run:
+        path: bash
+        args:
+        - -c
+        - |
+          set -e -x
+
+          # remove symlink from rootfs
+          rm /app
+
+          # extract droplet to /app
+          mkdir /app
+          tar zxf droplet/droplet.tgz -C /app
+
+          # start ngrok listener
+          ngrok authtoken $NGROK_TOKEN
+          ngrok http --log /tmp/ngrok.log --log-level debug --subdomain $(cat instances/name) 8080 &
+
+          cd /app
+
+          # some things depend on this
+          export HOME=$PWD
+
+          # load up buildpack-provided env if any
+          if [ -d .profile.d ]; then
+            for env_file in .profile.d/*; do
+              source $env_file
+            done
+          fi
+
+          # start the instance
+          ./start.sh
+    ensure:
+      put: instances
+      params: {remove: instances}
+
+- name: load-balancer
+  serial: true
+  plan:
+  - get: all-instances
+  - get: hm9001
+    trigger: true
+  - task: load-balancer
+    config:
+      platform: linux
+      image: docker:///cfv4/cfv4-load-balancer
+      inputs:
+      - name: all-instances
+      params:
+        INSTANCES_PRIVATE_KEY: {{instances-pool-private-key}}
+        NGROK_TOKEN: {{ngrok-token}}
+        NGROK_SUBDOMAIN: {{ngrok-subdomain}}
+      run:
+        path: bash
+        args:
+        - -c
+        - |
+          set -e
+
+          configure_pool_key() {
+            # set up pool key so we can continuously poll the repo
+            echo "$INSTANCES_PRIVATE_KEY" > /tmp/pool-key
+            chmod 0600 /tmp/pool-key
+            eval $(ssh-agent)
+            ssh-add /tmp/pool-key
+
+            # silence remote host verification
+            mkdir ~/.ssh
+            echo "StrictHostKeyChecking no" >> ~/.ssh/config
+            echo "LogLevel quiet" >> ~/.ssh/config
+
+            # ...shouldn't need that hanging around anymore
+            unset INSTANCES_PRIVATE_KEY
+          }
+
+          generate_config() {
+            instances=$*
+
+            echo "user nginx;"
+            echo "worker_processes 1;"
+            echo ""
+            echo "error_log /var/log/nginx/error.log warn;"
+            echo "pid /var/run/nginx.pid;"
+            echo ""
+            echo ""
+            echo "events {"
+            echo "    worker_connections 1024;"
+            echo "}"
+            echo ""
+            echo "http {"
+
+            # each instance has its own server so that we can
+            # preserve the destination's Host header
+            instance_port=8090
+            for instance in $instances; do
+              echo "    server {"
+              echo "        listen $instance_port;"
+              echo "        location / {"
+              echo "            proxy_pass http://$(basename $instance).ngrok.io;"
+              echo "        }"
+              echo "    }"
+              instance_port=$(expr $instance_port + 1)
+            done
+
+            # if there are instances configured, configure the load balancer
+            if ! [ -z "$instances" ]; then
+              echo "    upstream app {"
+              instance_port=8090
+              for instance in $instances; do
+                echo "        server 127.0.0.1:$instance_port;"
+                instance_port=$(expr $instance_port + 1)
+              done
+              echo "    }"
+            fi
+
+            echo ""
+            echo "    server {"
+            echo "        listen 8080;"
+            echo ""
+            echo "        location / {"
+
+            # if no instances, just return 503
+            if [ -z "$instances" ]; then
+              echo "            return 503;"
+
+            # otherwise, balance between them with aggressive failover
+            else
+              echo "            proxy_pass http://app;"
+              echo "            proxy_next_upstream error timeout invalid_header http_500 http_404;"
+            fi
+
+            echo "        }"
+            echo "    }"
+            echo "}"
+          }
+
+          # authorize ssh session for pulling from pool repo
+          configure_pool_key
+
+          # generate initial nginx config
+          generate_config $(ls ./all-instances/instances/*/*) > /etc/nginx/app.conf
+          echo "initial config:"
+          cat /etc/nginx/app.conf
+
+          # start nginx (daemonized) with initial config
+          nginx -c app.conf
+
+          # start forwarding to the load balancer
+          ngrok authtoken $NGROK_TOKEN
+          ngrok http --log /tmp/ngrok.log --log-level debug --subdomain NGROK_SUBDOMAIN 8080 &
+
+          cd all-instances
+
+          # switch to master for pulling later
+          git checkout master
+
+          # continuously keep routes up to date
+          while sleep 5; do
+            before=$(git rev-parse HEAD)
+            git pull >/dev/null
+            after=$(git rev-parse HEAD)
+
+            if [ "$before" != "$after" ]; then
+              generate_config $(ls ./instances/*/*) > /etc/nginx/app.conf
+
+              echo "new config:"
+              cat /etc/nginx/app.conf
+
+              # reload nginx config
+              pkill -F /var/run/nginx.pid -HUP
+            fi
+          done
