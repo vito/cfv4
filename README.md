@@ -9,7 +9,7 @@ routing.
    resource](https://github.com/concourse/pool-resource). As a shortcut, you
    can just fork this repo. This repo should be public; no secrets will be
    going into it, and the load balancer needs to be able to fetch it without
-   credentials to know which instances to your too.
+   credentials to know which instances to route to.
 
 1. Create an S3 bucket for storing the compiled app bits (droplets).
 
@@ -30,7 +30,7 @@ routing.
    all, so just do that.
 
 1. Trigger the `load-balancer` job to get things started. This will spin up an
-   `nginx` server that will balance requests acros your instances.
+   `nginx` server that will balance requests across your instances.
 
 1. Trigger `stage` to build a droplet. This will run automatically whenever
    your source bits change.
