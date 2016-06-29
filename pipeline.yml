@@ -54,7 +54,9 @@ jobs:
     config:
       platform: linux
       # stage using standard stack image
-      image: docker:///cloudfoundry/cflinuxfs2
+      image_resource: 
+        type: docker-image
+        source: {repository: cloudfoundry/cflinuxfs2}
       inputs:
       - name: app-source
       - name: buildpack
@@ -70,7 +72,9 @@ jobs:
   - task: build-droplet
     config:
       platform: linux
-      image: docker:///cloudfoundry/cflinuxfs2
+      image_resource: 
+        type: docker-image
+        source: {repository: cloudfoundry/cflinuxfs2}
       inputs:
       - name: stage
       - name: buildpack
@@ -113,7 +117,9 @@ jobs:
   - task: create-instance
     config:
       platform: linux
-      image: docker:///busybox
+      image_resource: 
+        type: docker-image
+        source: {repository: busybox}
       run:
         path: sh
         args:
@@ -130,7 +136,9 @@ jobs:
   - task: run
     config:
       platform: linux
-      image: docker:///cfv4/cfv4-app-stack
+      image_resource: 
+        type: docker-image
+        source: {repository: cfv4/cfv4-app-stack}
       inputs:
       - name: droplet
       - name: instances
@@ -182,7 +190,9 @@ jobs:
   - task: load-balancer
     config:
       platform: linux
-      image: docker:///cfv4/cfv4-load-balancer
+      image_resource: 
+        type: docker-image
+        source: {repository: cfv4/cfv4-load-balancer}
       inputs:
       - name: all-instances
       params:
